@@ -228,6 +228,15 @@ class OpenCVCamera(Camera):
             # Set FOURCC last to make sure the requested pixel format is actually enforced.
             self._validate_fourcc()
 
+        # Request a 1-frame driver buffer so each read returns the NEWEST frame, not the oldest queued
+        # one. V4L2 defaults to ~4 buffers, which adds up to ~3 frames (~100ms at 30fps) of latency
+        # between capture and our background read loop. Best-effort: some backends ignore it (harmless),
+        # and it must be set before streaming starts — this runs before _start_read_thread().
+        try:
+            self.videocapture.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+        except Exception:  # noqa: BLE001 — never let an unsupported prop break connect
+            pass
+
     def _validate_fps(self) -> None:
         """Validates and sets the camera's frames per second (FPS)."""
 
@@ -446,7 +455,9 @@ class OpenCVCamera(Camera):
             raise RuntimeError(f"{self}: stop_event is not initialized before starting read loop.")
 
         failure_count = 0
-        while not self.stop_event.is_set():
+        # `disconnect()` nulls stop_event while this thread may still be looping; tolerate that race
+        # (treat a None stop_event as "stop") instead of raising AttributeError during teardown.
+        while self.stop_event is not None and not self.stop_event.is_set():
             try:
                 raw_frame = self._read_from_hardware()
                 processed_frame = self._postprocess_image(raw_frame)

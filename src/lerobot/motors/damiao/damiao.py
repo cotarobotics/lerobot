@@ -64,6 +64,11 @@ MEDIUM_TIMEOUT_SEC = 0.01
 SHORT_TIMEOUT_SEC = 0.001
 PRECISE_TIMEOUT_SEC = 0.0001
 
+# Abort the session after a motor misses this many CONSECUTIVE refreshes (a single dropped packet is
+# transient and tolerated). At the control rate this is a fraction of a second, so a motor that loses
+# power / unplugs / latches a fault ends the session promptly instead of being driven on stale state.
+MAX_CONSECUTIVE_DROPS = 5
+
 
 class MotorState(TypedDict):
     position: float
@@ -146,6 +151,11 @@ class DamiaoMotorsBus(MotorsBusBase):
             }
             for name in self.motors
         }
+
+        # Per-motor count of CONSECUTIVE refresh misses. A few dropped packets are normal/transient
+        # (we just reuse the last state), but a motor that stops responding entirely (powered off,
+        # unplugged, latched fault) must ABORT the session instead of silently driving on stale data.
+        self._consecutive_drops: dict[str, int] = {name: 0 for name in self.motors}
 
         # Dynamic gains storage
         # Defaults: Kp=10.0 (Stiffness), Kd=0.5 (Damping)
@@ -258,7 +268,9 @@ class DamiaoMotorsBus(MotorsBusBase):
 
         if disable_torque:
             try:
-                self.disable_torque()
+                # Retry: a single dropped CAN packet (e.g. a flaky gripper motor) must not leave a
+                # motor energized/latched after disconnect.
+                self.disable_torque(num_retry=3)
             except Exception as e:
                 logger.warning(f"Failed to disable torque during disconnect: {e}")
 
@@ -698,8 +710,19 @@ class DamiaoMotorsBus(MotorsBusBase):
             msg = responses.get(recv_id)
             if msg:
                 self._process_response(motor, msg)
+                self._consecutive_drops[motor] = 0          # responded → clear the miss streak
             else:
-                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}). Using last known state.")
+                n = self._consecutive_drops.get(motor, 0) + 1
+                self._consecutive_drops[motor] = n
+                if n >= MAX_CONSECUTIVE_DROPS:
+                    # The motor has stopped responding entirely — abort instead of driving on stale
+                    # state. Propagates up through get_observation → record_loop → the session ends and
+                    # releases the arms (no more silently cooking a dropped/faulted motor).
+                    raise RuntimeError(
+                        f"{motor} (ID 0x{recv_id:02X}) stopped responding — {n} consecutive misses "
+                        f"(powered off, unplugged, or latched fault). Aborting session.")
+                logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}) "
+                               f"[{n}/{MAX_CONSECUTIVE_DROPS}]. Using last known state.")
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
