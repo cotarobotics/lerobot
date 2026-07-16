@@ -21,7 +21,7 @@ from lerobot.cameras import CameraConfig
 from ..config import RobotConfig
 
 LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
-    "joint_1": (-75.0, 75.0),
+    "joint_1": (-110.0, 75),
     "joint_2": (-180.0, 9.0),
     "joint_3": (-85.0, 85.0),
     "joint_4": (0.0, 135.0),
@@ -32,7 +32,7 @@ LEFT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
 }
 
 RIGHT_DEFAULT_JOINTS_LIMITS: dict[str, tuple[float, float]] = {
-    "joint_1": (-75.0, 75.0),
+    "joint_1": (-75.0, 110),
     "joint_2": (-9.0, 180.0),
     "joint_3": (-85.0, 85.0),
     "joint_4": (0.0, 135.0),

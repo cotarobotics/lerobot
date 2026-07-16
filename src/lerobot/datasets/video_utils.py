@@ -994,6 +994,410 @@ class StreamingVideoEncoder:
         self._video_paths.clear()
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# Subprocess streaming encoder
+#
+# Why this exists: with an nvenc vcodec, the FIRST encode() call on a
+# _CameraEncoderThread lazily opens the NVENC session (CUDA context + per-stream
+# encoder). PyAV holds the GIL through that open — measured at ~137 ms per camera
+# even with a warm CUDA context (~300 ms cold) — and it recurs every episode, per
+# camera. In-process, that GIL hold starves the recording process's 30 Hz control
+# loop: the follower's Present_Position sync_read times out ("no status packet"),
+# the episode aborts, and the follower jumps.
+#
+# Moving the whole streaming encoder into a spawned child process takes NVENC (and
+# its GIL-holding session open + all encode() calls) off the parent entirely. The
+# child hosts an ordinary in-process StreamingVideoEncoder (thread-per-camera); the
+# parent ships raw frames to it over a small pool of shared-memory slots and a
+# command queue. The parent's control loop never touches CUDA and never blocks on
+# the encoder — a full shared-memory slot pool just drops frames (as the in-process
+# encoder already does when its queue is full).
+#
+# spawn, not fork: CUDA cannot be initialized across a fork, and the parent must
+# never initialize CUDA. spawn also means the child re-imports this module fresh
+# WITHOUT collect.py's get_codec_options monkeypatch (which stringifies the nvenc
+# `rc` option so PyAV's add_stream accepts it) — so the child re-applies that same
+# fix itself in _subprocess_encoder_main before building the encoder.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# Per-camera shared-memory ring depth. This must cover the burst of frames the parent produces while
+# the child can't drain slots — chiefly the per-episode NVENC session open, which holds the CHILD's
+# GIL for ~137 ms/camera (serialized => N_cameras × ~137 ms). The parent keeps recording through that
+# window (that's the whole point — the robot no longer freezes), so those frames must buffer here or
+# they drop. 24 slots ≈ 800 ms at 30 fps, comfortably covering a several-camera cold start; raise it
+# via OPENARM_ENCODE_SHM_BUFFERS if you still see startup drops. Memory = slots × cameras × frame bytes.
+_SHM_BUFFERS_PER_KEY = int(os.environ.get("OPENARM_ENCODE_SHM_BUFFERS", "24"))
+
+
+def _patch_nvenc_codec_options() -> None:
+    """Re-apply collect.py's get_codec_options string-coercion fix in this (child) process.
+
+    lerobot's VideoEncoderConfig.get_codec_options builds the nvenc branch with an int `rc`
+    even when as_strings=True; PyAV's add_stream requires all option VALUES to be strings and
+    raises TypeError otherwise. Idempotent (guarded by a sentinel)."""
+    if getattr(VideoEncoderConfig.get_codec_options, "_nvenc_str_safe", False):
+        return
+    _orig = VideoEncoderConfig.get_codec_options
+
+    def _str_safe(self, encoder_threads=None, as_strings=False):
+        opts = _orig(self, encoder_threads, as_strings)
+        if as_strings:
+            opts = {k: (v if isinstance(v, str) else str(v)) for k, v in opts.items()}
+        return opts
+
+    _str_safe._nvenc_str_safe = True
+    VideoEncoderConfig.get_codec_options = _str_safe
+
+
+def _warm_nvenc_session(camera_encoder: VideoEncoderConfig, fps: int, encoder_threads: int | None) -> None:
+    """Create the CUDA context + a throwaway NVENC session once, in THIS process.
+
+    Only meaningful in the child, where it pays the one-time (process-global) CUDA-context cost at
+    startup so the first real episode's per-camera session opens are cheaper — and, being in the
+    child, never touch the parent's control-loop GIL. No-op for software codecs. Best-effort."""
+    if "nvenc" not in camera_encoder.vcodec:
+        return
+    try:
+        options = camera_encoder.get_codec_options(encoder_threads, as_strings=True)
+        tmp = Path(tempfile.mkdtemp(prefix="nvenc_warm_")) / "warm.mp4"
+        container = av.open(str(tmp), "w")
+        stream = container.add_stream(camera_encoder.vcodec, fps, options=options)
+        stream.pix_fmt = camera_encoder.pix_fmt
+        stream.width = stream.height = 256
+        stream.time_base = Fraction(1, fps)
+        dummy = Image.fromarray(np.zeros((256, 256, 3), dtype=np.uint8))
+        for i in range(2):
+            vf = av.VideoFrame.from_image(dummy)
+            vf.pts = i
+            vf.time_base = Fraction(1, fps)
+            pkt = stream.encode(vf)
+            if pkt:
+                container.mux(pkt)
+        pkt = stream.encode()
+        if pkt:
+            container.mux(pkt)
+        container.close()
+        shutil.rmtree(tmp.parent, ignore_errors=True)
+    except Exception as e:  # noqa: BLE001 — warm-up is an optimization; never fail the child on it
+        logger.warning(f"NVENC warm-up in encoder subprocess failed (non-fatal): {e}")
+
+
+def _subprocess_encoder_main(cmd_q, resp_q, free_q, enc_kwargs: dict) -> None:
+    """Child-process entry point: host an in-process StreamingVideoEncoder and drive it from the
+    parent's command queue. Frames arrive via named shared-memory slots (see
+    SubprocessStreamingVideoEncoder). Runs in a spawned process, so it re-applies the nvenc option
+    fix and re-initializes everything from scratch."""
+    from multiprocessing import shared_memory
+
+    logging.getLogger("libav").setLevel(av.logging.WARNING)
+    _patch_nvenc_codec_options()
+
+    try:
+        encoder = StreamingVideoEncoder(**enc_kwargs)
+        _warm_nvenc_session(encoder._camera_encoder, encoder.fps, encoder._encoder_threads)
+        resp_q.put(("ready", None))
+    except Exception as e:  # noqa: BLE001 — report so the parent can fall back to in-process
+        resp_q.put(("ready_error", repr(e)))
+        return
+
+    shms: dict[str, list] = {}          # video_key -> [SharedMemory, ...]
+    views: dict[str, list] = {}         # video_key -> [np.ndarray view into each slot]
+    epoch = 0                           # current episode epoch (tags frees back to the parent)
+
+    while True:
+        op, *rest = cmd_q.get()
+
+        if op == "alloc":
+            key, names, shape, dtype = rest
+            slots, slot_views = [], []
+            for name in names:
+                # Attach only — the PARENT created these blocks and is the sole owner that unlinks
+                # them (in close()). The child just close()s its handles; attaching re-registers the
+                # name in the shared resource_tracker set idempotently, and the parent's unlink()
+                # balances it, so no premature unlink and no double-unregister KeyError.
+                shm = shared_memory.SharedMemory(name=name)
+                slots.append(shm)
+                slot_views.append(np.ndarray(shape, dtype=np.dtype(dtype), buffer=shm.buf))
+            shms[key], views[key] = slots, slot_views
+
+        elif op == "start":
+            video_keys, temp_dir, epoch = rest
+            try:
+                encoder.start_episode(video_keys, Path(temp_dir))
+            except Exception as e:  # noqa: BLE001
+                resp_q.put(("error", f"start_episode failed: {e!r}"))
+
+        elif op == "feed":
+            key, idx = rest
+            frame = views[key][idx].copy()   # copy OUT of shared memory before releasing the slot
+            free_q.put((epoch, key, idx))    # release the slot immediately (never blocked by encode)
+            try:
+                encoder.feed_frame(key, frame)
+            except Exception as e:  # noqa: BLE001 — surface an encoder-thread crash to the parent
+                resp_q.put(("error", f"{key}: {e}"))
+
+        elif op == "finish":
+            try:
+                results = encoder.finish_episode()
+                resp_q.put(("finish_ok", {k: (str(p), stats) for k, (p, stats) in results.items()}))
+            except Exception as e:  # noqa: BLE001
+                resp_q.put(("finish_error", repr(e)))
+
+        elif op == "cancel":
+            with contextlib.suppress(Exception):
+                encoder.cancel_episode()
+            resp_q.put(("cancel_ok", None))
+
+        elif op == "close":
+            with contextlib.suppress(Exception):
+                encoder.close()
+            for slots in shms.values():
+                for shm in slots:
+                    with contextlib.suppress(Exception):
+                        shm.close()
+            resp_q.put(("close_ok", None))
+            return
+
+
+class SubprocessStreamingVideoEncoder:
+    """Drop-in replacement for :class:`StreamingVideoEncoder` that runs the actual encoder in a
+    spawned child process, so nvenc's GIL-holding session open never hitches the parent's control
+    loop. Same public API: start_episode / feed_frame / finish_episode / cancel_episode / close.
+
+    Frame transport: a small per-camera ring of shared-memory slots (``OPENARM_ENCODE_SHM_BUFFERS``,
+    default 8). feed_frame copies the frame into a free slot and sends a tiny descriptor; the child
+    copies it out and frees the slot. If no slot is free (encoder behind), the frame is dropped with
+    a warning — same back-pressure behavior as the in-process encoder's full queue."""
+
+    def __init__(
+        self,
+        fps: int,
+        camera_encoder: VideoEncoderConfig | None = None,
+        queue_maxsize: int = 30,
+        encoder_threads: int | None = None,
+        n_buffers: int = _SHM_BUFFERS_PER_KEY,
+    ):
+        import multiprocessing as mp
+
+        self.fps = fps
+        self._n_buffers = max(2, n_buffers)
+        self._ctx = mp.get_context("spawn")
+        self._cmd_q = self._ctx.Queue()
+        self._resp_q = self._ctx.Queue()
+        self._free_q = self._ctx.Queue()
+
+        enc_kwargs = {
+            "fps": fps,
+            "camera_encoder": camera_encoder,
+            "queue_maxsize": queue_maxsize,
+            "encoder_threads": encoder_threads,
+        }
+        self._proc = self._ctx.Process(
+            target=_subprocess_encoder_main,
+            args=(self._cmd_q, self._resp_q, self._free_q, enc_kwargs),
+            daemon=True,
+        )
+        self._proc.start()
+
+        # Per-key shared-memory pools, created lazily on the first frame of each key (sized exactly
+        # to that key's frame). Reused across episodes — frame shape/dtype per key is constant.
+        self._pools: dict[str, list] = {}
+        self._views: dict[str, list] = {}
+        self._free_slots: dict[str, list[int]] = {}
+        self._slot_nbytes: dict[str, int] = {}
+        self._dropped_frames: dict[str, int] = {}
+        self._epoch = 0   # bumped per episode; tags frees so stale ones can't cross an episode boundary
+
+        self._episode_active = False
+        self._closed = False
+
+        # Wait for the child to build + warm the encoder. A failure here propagates so the caller
+        # (_build_streaming_encoder) can fall back to the in-process encoder. Bounded + liveness-checked:
+        # spawn re-imports the parent's __main__ (heavy: torch/cv2/lerobot), and if the child dies during
+        # that import it never posts a reply — so poll for the reply OR the process exiting, with a cap.
+        import time as _time
+
+        startup_timeout = float(os.environ.get("OPENARM_ENCODE_SUBPROCESS_TIMEOUT", "120"))
+        deadline = _time.monotonic() + startup_timeout
+        tag = payload = None
+        while _time.monotonic() < deadline:
+            try:
+                tag, payload = self._resp_q.get(timeout=1.0)
+                break
+            except queue.Empty:
+                if not self._proc.is_alive():
+                    self.close()
+                    raise RuntimeError(
+                        f"encoder subprocess exited during startup (code {self._proc.exitcode})"
+                    )
+        if tag != "ready":
+            self.close()
+            raise RuntimeError(f"encoder subprocess failed to start: {payload}")
+        logger.info(
+            f"Streaming video encoder running in subprocess (pid={self._proc.pid}, "
+            f"{self._n_buffers} shm buffers/camera) — NVENC init + encode are off the control-loop GIL."
+        )
+
+    # ── helpers ──────────────────────────────────────────────────────────────
+
+    def _drain_frees(self, discard: bool = False) -> None:
+        """Reclaim slots the child has finished copying out. Frees are tagged with the episode epoch
+        they belong to; a free from a prior episode (rare feeder-thread lag past the finish barrier)
+        is discarded so a slot can never be handed out twice within an episode. ``discard=True`` drops
+        everything (used at episode start to flush any straggler frees)."""
+        while True:
+            try:
+                epoch, key, idx = self._free_q.get_nowait()
+            except queue.Empty:
+                break
+            if discard or epoch != self._epoch:
+                continue
+            if key in self._free_slots:
+                self._free_slots[key].append(idx)
+
+    def _raise_if_child_error(self) -> None:
+        """Non-blocking check for an async error posted by the child (e.g. an encoder-thread crash).
+        Only ``error`` is posted asynchronously; all other replies are synchronous request/response,
+        so anything on the queue mid-episode is a genuine error."""
+        try:
+            tag, payload = self._resp_q.get_nowait()
+        except queue.Empty:
+            return
+        if tag == "error":
+            raise RuntimeError(f"Encoder subprocess error: {payload}")
+
+    def _alloc_pool(self, video_key: str, image: np.ndarray) -> None:
+        from multiprocessing import shared_memory
+
+        slots, views, names = [], [], []
+        for _ in range(self._n_buffers):
+            shm = shared_memory.SharedMemory(create=True, size=image.nbytes)
+            slots.append(shm)
+            views.append(np.ndarray(image.shape, dtype=image.dtype, buffer=shm.buf))
+            names.append(shm.name)
+        self._pools[video_key] = slots
+        self._views[video_key] = views
+        self._free_slots[video_key] = list(range(self._n_buffers))
+        self._slot_nbytes[video_key] = image.nbytes
+        self._cmd_q.put(("alloc", video_key, names, tuple(image.shape), np.dtype(image.dtype).str))
+
+    # ── public API (mirrors StreamingVideoEncoder) ─────────────────────────────
+
+    def start_episode(self, video_keys: list[str], temp_dir: Path) -> None:
+        if self._episode_active:
+            self.cancel_episode()
+        self._epoch += 1
+        self._drain_frees(discard=True)   # flush any straggler frees from the previous episode
+        self._dropped_frames.clear()
+        # All slots are free again once the previous episode finished/cancelled (the child frees each
+        # slot as it copies out, and finish/cancel are barriers). Reset bookkeeping defensively.
+        for key in self._pools:
+            self._free_slots[key] = list(range(self._n_buffers))
+        self._cmd_q.put(("start", list(video_keys), str(temp_dir), self._epoch))
+        self._episode_active = True
+
+    def feed_frame(self, video_key: str, image: np.ndarray) -> None:
+        if not self._episode_active:
+            raise RuntimeError("No active episode. Call start_episode() first.")
+        self._raise_if_child_error()
+        self._drain_frees()
+
+        image = np.ascontiguousarray(image)
+        if video_key not in self._pools:
+            self._alloc_pool(video_key, image)
+        elif image.nbytes != self._slot_nbytes[video_key]:
+            # Frame size changed unexpectedly for this key — can't fit the fixed slot; drop it.
+            self._note_drop(video_key, reason="frame size changed")
+            return
+
+        free = self._free_slots[video_key]
+        if not free:
+            self._note_drop(video_key)
+            return
+        idx = free.pop()
+        self._views[video_key][idx][...] = image
+        self._cmd_q.put(("feed", video_key, idx))
+
+    def _note_drop(self, video_key: str, reason: str = "encoder behind") -> None:
+        self._dropped_frames[video_key] = self._dropped_frames.get(video_key, 0) + 1
+        count = self._dropped_frames[video_key]
+        if count == 1 or count % 10 == 0:
+            logger.warning(
+                f"Encoder subprocess {reason} for {video_key}, dropped {count} frame(s). "
+                f"Increase OPENARM_ENCODE_SHM_BUFFERS or encoder_queue_maxsize if this persists."
+            )
+
+    def finish_episode(self) -> dict[str, tuple[Path, dict | None]]:
+        if not self._episode_active:
+            raise RuntimeError("No active episode to finish.")
+        for video_key, count in self._dropped_frames.items():
+            if count > 0:
+                logger.warning(f"Episode finished with {count} dropped frame(s) for {video_key}.")
+        self._cmd_q.put(("finish",))
+        # Block until the child has flushed + joined its encoder threads. Ignore any late async
+        # 'error' that raced ahead of the finish reply — the finish reply is authoritative.
+        while True:
+            tag, payload = self._resp_q.get()
+            if tag == "finish_ok":
+                self._episode_active = False
+                return {k: (Path(p), stats) for k, (p, stats) in payload.items()}
+            if tag == "finish_error":
+                self._episode_active = False
+                raise RuntimeError(f"Encoder subprocess finish failed: {payload}")
+            if tag == "error":
+                self._episode_active = False
+                raise RuntimeError(f"Encoder subprocess error: {payload}")
+
+    def cancel_episode(self) -> None:
+        if not self._episode_active:
+            return
+        self._cmd_q.put(("cancel",))
+        with contextlib.suppress(Exception):
+            self._drain_pending_until("cancel_ok", timeout=10)
+        self._episode_active = False
+
+    def _drain_pending_until(self, expected_tag: str, timeout: float) -> None:
+        import time as _time
+
+        deadline = _time.monotonic() + timeout
+        while _time.monotonic() < deadline:
+            try:
+                tag, _ = self._resp_q.get(timeout=max(0.0, deadline - _time.monotonic()))
+            except queue.Empty:
+                return
+            if tag == expected_tag:
+                return
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        if self._episode_active:
+            with contextlib.suppress(Exception):
+                self.cancel_episode()
+        with contextlib.suppress(Exception):
+            self._cmd_q.put(("close",))
+            self._drain_pending_until("close_ok", timeout=10)
+        with contextlib.suppress(Exception):
+            self._proc.join(timeout=10)
+        if self._proc.is_alive():
+            with contextlib.suppress(Exception):
+                self._proc.terminate()
+        # Parent owns the shared-memory blocks: close AND unlink them here.
+        for slots in self._pools.values():
+            for shm in slots:
+                with contextlib.suppress(Exception):
+                    shm.close()
+                with contextlib.suppress(Exception):
+                    shm.unlink()
+        self._pools.clear()
+        self._views.clear()
+        self._free_slots.clear()
+        for q in (self._cmd_q, self._resp_q, self._free_q):
+            with contextlib.suppress(Exception):
+                q.close()
+
+
 @dataclass
 class VideoFrame:
     # TODO(rcadene, lhoestq): move to Hugging Face `datasets` repo

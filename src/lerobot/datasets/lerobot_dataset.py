@@ -15,6 +15,7 @@
 # limitations under the License.
 import contextlib
 import logging
+import os
 from collections.abc import Callable
 from pathlib import Path
 
@@ -37,6 +38,7 @@ from .utils import (
 )
 from .video_utils import (
     StreamingVideoEncoder,
+    SubprocessStreamingVideoEncoder,
     get_safe_default_video_backend,
 )
 
@@ -324,7 +326,28 @@ class LeRobotDataset(torch.utils.data.Dataset):
         camera_encoder: VideoEncoderConfig | None,
         encoder_queue_maxsize: int,
         encoder_threads: int | None,
-    ) -> StreamingVideoEncoder:
+    ):
+        # nvenc's first-frame session open holds the GIL (~137 ms/camera, every episode) and starves
+        # the recording process's control loop. Run the encoder in a spawned child process so that
+        # cost never touches the parent. Default: subprocess iff the codec is nvenc; override with
+        # OPENARM_ENCODE_SUBPROCESS=1 (force on) / =0 (force off, in-process). Falls back to the
+        # in-process encoder if the subprocess can't start.
+        vcodec = camera_encoder.vcodec if camera_encoder is not None else ""
+        force = os.environ.get("OPENARM_ENCODE_SUBPROCESS")
+        want_subprocess = force == "1" or (force != "0" and "nvenc" in vcodec)
+        if want_subprocess:
+            try:
+                return SubprocessStreamingVideoEncoder(
+                    fps=fps,
+                    camera_encoder=camera_encoder,
+                    queue_maxsize=encoder_queue_maxsize,
+                    encoder_threads=encoder_threads,
+                )
+            except Exception as e:  # noqa: BLE001 — degrade to in-process rather than fail recording
+                logger.warning(
+                    f"Streaming encoder subprocess unavailable ({e}); "
+                    f"falling back to in-process encoding."
+                )
         return StreamingVideoEncoder(
             fps=fps,
             camera_encoder=camera_encoder,

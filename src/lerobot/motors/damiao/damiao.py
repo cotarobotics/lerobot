@@ -69,6 +69,24 @@ PRECISE_TIMEOUT_SEC = 0.0001
 # power / unplugs / latches a fault ends the session promptly instead of being driven on stale state.
 MAX_CONSECUTIVE_DROPS = 5
 
+# Damiao MIT feedback frames carry a status/error code in the high nibble of data[0]. A motor that
+# latches a fault (over-temp, over-current, over-voltage, overload) stops answering refreshes entirely,
+# so the LAST status seen before it went silent is the best clue to WHY it dropped. We decode and stash
+# it on every good frame and surface it in the drop/abort messages. Codes per the DM MIT protocol.
+DM_STATUS_CODES = {
+    0x0: "disabled",
+    0x1: "enabled",
+    0x8: "OVER-VOLTAGE",
+    0x9: "UNDER-VOLTAGE",
+    0xA: "OVER-CURRENT",
+    0xB: "MOS OVER-TEMP",
+    0xC: "ROTOR OVER-TEMP",
+    0xD: "COMMS LOSS",
+    0xE: "OVERLOAD",
+}
+# Non-nominal status codes (anything but disabled/enabled) indicate a latched or developing fault.
+DM_FAULT_CODES = frozenset(DM_STATUS_CODES) - {0x0, 0x1}
+
 
 class MotorState(TypedDict):
     position: float
@@ -76,6 +94,7 @@ class MotorState(TypedDict):
     torque: float
     temp_mos: float
     temp_rotor: float
+    status: int  # DM status/error nibble from the last good frame; see DM_STATUS_CODES
 
 
 class DamiaoMotorsBus(MotorsBusBase):
@@ -148,6 +167,7 @@ class DamiaoMotorsBus(MotorsBusBase):
                 "torque": 0.0,
                 "temp_mos": 0.0,
                 "temp_rotor": 0.0,
+                "status": 0x1,  # assume enabled until the first frame says otherwise
             }
             for name in self.motors
         }
@@ -585,12 +605,24 @@ class DamiaoMotorsBus(MotorsBusBase):
             motor_type = self._motor_types[motor]
             pos, vel, torque, t_mos, t_rotor = self._decode_motor_state(msg.data, motor_type)
 
+            # High nibble of data[0] is the DM status/error code. Capture it so a subsequent
+            # drop/abort can report WHY the motor stopped (a latched fault reports its cause on
+            # the last frame before it goes silent).
+            status = (msg.data[0] >> 4) & 0x0F
+            if status in DM_FAULT_CODES:
+                logger.warning(
+                    f"{motor} reports status 0x{status:X} "
+                    f"({DM_STATUS_CODES.get(status, 'unknown')}) — "
+                    f"T_mos={t_mos}C T_rotor={t_rotor}C tau={torque:.2f}"
+                )
+
             self._last_known_states[motor] = {
                 "position": pos,
                 "velocity": vel,
                 "torque": torque,
                 "temp_mos": float(t_mos),
                 "temp_rotor": float(t_rotor),
+                "status": status,
             }
         except Exception as e:
             logger.warning(f"Failed to decode response from {motor}: {e}")
@@ -714,15 +746,24 @@ class DamiaoMotorsBus(MotorsBusBase):
             else:
                 n = self._consecutive_drops.get(motor, 0) + 1
                 self._consecutive_drops[motor] = n
+                last = self._last_known_states[motor]
+                code = last.get("status", 0x1)
+                status = f"0x{code:X} ({DM_STATUS_CODES.get(code, 'unknown')})"
+                # Last state seen just before the motor went silent — a latched fault names its
+                # cause here (e.g. status OVER-CURRENT / OVERLOAD), a clean comms/connector loss
+                # goes silent while still reporting 'enabled'.
+                context = (f"last status {status}, T_mos={last['temp_mos']:.0f}C "
+                           f"T_rotor={last['temp_rotor']:.0f}C, tau={last['torque']:.2f}, "
+                           f"pos={last['position']:.1f}deg")
                 if n >= MAX_CONSECUTIVE_DROPS:
                     # The motor has stopped responding entirely — abort instead of driving on stale
                     # state. Propagates up through get_observation → record_loop → the session ends and
                     # releases the arms (no more silently cooking a dropped/faulted motor).
                     raise RuntimeError(
-                        f"{motor} (ID 0x{recv_id:02X}) stopped responding — {n} consecutive misses "
-                        f"(powered off, unplugged, or latched fault). Aborting session.")
+                        f"{motor} (ID 0x{recv_id:02X}) stopped responding — {n} consecutive misses. "
+                        f"Aborting session. [{context}]")
                 logger.warning(f"Packet drop: {motor} (ID: 0x{recv_id:02X}) "
-                               f"[{n}/{MAX_CONSECUTIVE_DROPS}]. Using last known state.")
+                               f"[{n}/{MAX_CONSECUTIVE_DROPS}]. Using last known state. [{context}]")
 
     @check_if_not_connected
     def sync_write(self, data_name: str, values: dict[str, Value]) -> None:
